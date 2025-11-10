@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Optional
 
 from fastapi import FastAPI, HTTPException, Path, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -16,6 +16,10 @@ app = FastAPI(
     ],
 )
 
+# Track database availability for diagnostics
+_db_ready: bool = False
+_db_error: Optional[str] = None
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # In production, restrict allowed origins.
@@ -29,8 +33,19 @@ app.add_middleware(
 def on_startup() -> None:
     """
     Initialize database schema on startup.
+    This is wrapped in a try/except so the service can start and expose diagnostics
+    even if the database is unavailable at boot time.
     """
-    db.ensure_schema()
+    global _db_ready, _db_error
+    try:
+        db.ensure_schema()
+        _db_ready = True
+        _db_error = None
+    except Exception as exc:  # pragma: no cover - defensive startup behavior
+        # Do not crash the whole service; record state for health endpoint
+        _db_ready = False
+        _db_error = "Database initialization failed"
+        # Intentionally avoid logging sensitive details
 
 
 @app.get("/", tags=["health"], summary="Health Check")
@@ -39,9 +54,9 @@ def health_check():
     Simple health check endpoint.
 
     Returns:
-        JSON with a 'message' key indicating service health.
+        JSON with a 'message' key indicating service health and DB readiness flag.
     """
-    return {"message": "Healthy"}
+    return {"message": "Healthy", "db_ready": _db_ready}
 
 
 # PUBLIC_INTERFACE
@@ -59,7 +74,11 @@ def list_todos() -> List[TodoOut]:
     Returns:
         List of TodoOut items.
     """
-    rows = db.query_all_todos()
+    try:
+        rows = db.query_all_todos()
+    except Exception as exc:
+        # Surface a consistent error without leaking DB details
+        raise HTTPException(status_code=503, detail="Database unavailable.") from exc
     return [TodoOut(**r) for r in rows]
 
 
@@ -91,7 +110,7 @@ def create_todo(payload: TodoCreate) -> TodoOut:
         )
     except Exception as exc:
         # Avoid leaking sensitive DB info
-        raise HTTPException(status_code=500, detail="Failed to create todo.") from exc
+        raise HTTPException(status_code=503, detail="Database unavailable.") from exc
     return TodoOut(**created)
 
 
@@ -118,7 +137,10 @@ def get_todo(
     Raises:
         HTTPException 404 if not found.
     """
-    row = db.query_todo_by_id(todo_id)
+    try:
+        row = db.query_todo_by_id(todo_id)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="Database unavailable.") from exc
     if not row:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Todo not found.")
     return TodoOut(**row)
@@ -149,12 +171,15 @@ def replace_todo(
     Raises:
         HTTPException 404 if not found.
     """
-    updated = db.update_todo(
-        todo_id=todo_id,
-        title=payload.title.strip() if payload.title is not None else None,
-        description=payload.description if payload.description is not None else None,
-        completed=payload.completed if payload.completed is not None else None,
-    )
+    try:
+        updated = db.update_todo(
+            todo_id=todo_id,
+            title=payload.title.strip() if payload.title is not None else None,
+            description=payload.description if payload.description is not None else None,
+            completed=payload.completed if payload.completed is not None else None,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="Database unavailable.") from exc
     if not updated:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Todo not found.")
     return TodoOut(**updated)
@@ -185,12 +210,15 @@ def patch_todo(
     Raises:
         HTTPException 404 if not found.
     """
-    updated = db.update_todo(
-        todo_id=todo_id,
-        title=payload.title.strip() if payload.title is not None else None,
-        description=payload.description if payload.description is not None else None,
-        completed=payload.completed if payload.completed is not None else None,
-    )
+    try:
+        updated = db.update_todo(
+            todo_id=todo_id,
+            title=payload.title.strip() if payload.title is not None else None,
+            description=payload.description if payload.description is not None else None,
+            completed=payload.completed if payload.completed is not None else None,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="Database unavailable.") from exc
     if not updated:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Todo not found.")
     return TodoOut(**updated)
@@ -216,7 +244,10 @@ def delete_todo(
     Raises:
         HTTPException 404 if not found.
     """
-    ok = db.delete_todo(todo_id)
+    try:
+        ok = db.delete_todo(todo_id)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="Database unavailable.") from exc
     if not ok:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Todo not found.")
     # 204 No Content
